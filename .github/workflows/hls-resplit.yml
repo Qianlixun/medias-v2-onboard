@@ -1,0 +1,158 @@
+name: HLS 分片重切（关键帧对齐小分片）
+
+# 目的：把巨型 .ts 分片（27~65MB）重切为 ~6s 关键帧对齐的小分片，
+# 配合 fastly.jsdelivr.net CDN 播放（jsDelivr 单文件上限 20MB，且大分片冷启动极慢）。
+# ffmpeg -c copy 无损重切，不重编码。
+#
+# 磁盘策略：blobless 克隆 + 旧分片走 raw URL 直接 curl 到工作区（不进 .git），
+# 每个视频处理完即推送 + 清理工作区，中断后可重跑（m3u8 内标记幂等跳过）。
+#
+# 触发约定：仅当本工作流文件变更时自动跑（首次推送即触发）；
+# 自身提交不含 .github/ 变更，不会循环触发。也可手动 workflow_dispatch。
+on:
+  push:
+    paths:
+      - .github/workflows/hls-resplit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  resplit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      MARKER: '#ZX-HLS-RESPLIT:v1'
+      SEG_TIME: '6'
+    steps:
+      - name: 安装 ffmpeg（ubuntu-24.04 镜像不预装）
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg >/dev/null
+          ffmpeg -version | head -1
+
+      - name: 准备仓库（blobless 克隆，index=HEAD）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
+          git config core.quotepath false   # 中文文件名原样输出
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git read-tree HEAD                # 填充 index，不动工作区
+          echo "=== 磁盘 ==="; df -h / | tail -1
+
+      - name: 逐 m3u8 重切分片
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mapfile -t playlists < <(git ls-tree -r HEAD --name-only | grep '\.m3u8$' || true)
+          echo "发现 ${#playlists[@]} 个 m3u8"
+          : > purged.list
+
+          for m in "${playlists[@]}"; do
+            echo ""
+            echo "===== 处理 $m ====="
+
+            # 已处理过则跳过（幂等，支持中断续跑）
+            if git show "HEAD:$m" | grep -qF "$MARKER"; then
+              echo "已处理过，跳过"
+              continue
+            fi
+
+            # 按顺序取出分片名（非注释行，兼容 CRLF）
+            mapfile -t segs < <(git show "HEAD:$m" | tr -d '\r' | grep -v '^#' | sed '/^\s*$/d')
+            if [ "${#segs[@]}" -eq 0 ]; then
+              echo "清单无分片，跳过"
+              continue
+            fi
+
+            # 分片须全部存在于当前 HEAD（防误删他引用）
+            missing=0
+            for s in "${segs[@]}"; do
+              if ! git cat-file -e "HEAD:$s" 2>/dev/null; then
+                echo "::warning::分片缺失 $s，跳过该视频"
+                missing=1
+              fi
+            done
+            [ "$missing" = 0 ] || continue
+
+            base="${m%.m3u8}"
+            echo "拉取 ${#segs[@]} 个旧分片（raw 直连，不进 .git）..."
+            for s in "${segs[@]}"; do
+              u="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/$(jq -rn --arg p "$s" '$p|@uri')"
+              curl -sSfL --retry 3 -o "$s" "$u"
+            done
+
+            # 拼回完整流（旧分片本是单条 TS 的字节切分，cat 即还原）
+            full=".work-full.ts"
+            rm -f "$full"
+            for s in "${segs[@]}"; do cat "$s" >> "$full"; done
+
+            # -c copy 按关键帧重切（无损，只在关键帧处落刀）
+            rm -f "${base}-hls-"*.ts
+            ffmpeg -hide_banner -loglevel error -y -i "$full" \
+              -c copy -f segment -segment_time "$SEG_TIME" \
+              -segment_list .work-list.m3u8 -segment_list_type m3u8 \
+              "${base}-hls-%05d.ts"
+            rm -f "$full"
+
+            chunks=("${base}-hls-"*.ts)
+            if [ ${#chunks[@]} -eq 0 ]; then
+              echo "::error::ffmpeg 未产出分片：$base"
+              continue
+            fi
+
+            # 分片体积检查（jsDelivr 单文件 20MB 上限）
+            for c in "${chunks[@]}"; do
+              sz=$(stat -c%s "$c")
+              if [ "$sz" -gt 19000000 ]; then
+                echo "::warning::分片 $((sz/1024/1024))MB 超 19MB（jsDelivr 会 403）：$c"
+              fi
+            done
+
+            # 整理清单：VOD 化 + 补 ENDLIST + 幂等标记
+            sed -i 's/#EXT-X-PLAYLIST-TYPE:EVENT/#EXT-X-PLAYLIST-TYPE:VOD/' .work-list.m3u8
+            grep -q '^#EXT-X-ENDLIST' .work-list.m3u8 || echo '#EXT-X-ENDLIST' >> .work-list.m3u8
+            sed -i "2a $MARKER" .work-list.m3u8
+            cp .work-list.m3u8 "$m"
+
+            # 更新 index：删旧分片、加新分片与新清单（只动本视频的路径）
+            set -f
+            git rm -q --cached -- "${segs[@]}"
+            set +f
+            git add -- "$m" "${chunks[@]}"
+
+            git commit -q -m "chore: 重切 HLS 分片为 ${SEG_TIME}s 关键帧对齐小分片 — $base"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
+
+            # 清理工作区（新分片 blob 已随提交进入 .git，工作区副本可删）
+            set -f
+            rm -f -- "${segs[@]}"
+            set +f
+            rm -f -- "${chunks[@]}" .work-list.m3u8
+            printf '%s\n' "$m" >> purged.list
+            echo "完成：$base → ${#chunks[@]} 个新分片"
+            df -h / | tail -1
+          done
+
+          echo ""
+          echo "=== 全部完成：$(wc -l < purged.list) 个清单被重写 ==="
+
+      - name: 清理 jsDelivr CDN 缓存（清单内容已变，URL 未变）
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s purged.list ] || { echo "无清单需要清理"; exit 0; }
+          while IFS= read -r m; do
+            url=$(python3 -c "import urllib.parse,sys; print('https://purge.jsdelivr.net/gh/' + sys.argv[1] + '@main/' + urllib.parse.quote(sys.argv[2]))" "$GITHUB_REPOSITORY" "$m")
+            echo "purge: $url"
+            curl -sS -o /dev/null -w "%{http_code}\n" --max-time 30 "$url" || true
+          done < purged.list
