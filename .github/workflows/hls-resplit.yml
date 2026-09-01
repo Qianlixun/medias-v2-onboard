@@ -1,11 +1,16 @@
 name: HLS 分片重切（关键帧对齐小分片）
 
-# 目的：把巨型 .ts 分片（27~65MB）重切为 ~6s 关键帧对齐的小分片，
+# 目的：把巨型 .ts 分片（27~65MB）重切为关键帧对齐的小分片，
 # 配合 fastly.jsdelivr.net CDN 播放（jsDelivr 单文件上限 20MB，且大分片冷启动极慢）。
 # ffmpeg -c copy 无损重切，不重编码。
 #
+# 自适应分片：高码率视频（~40Mbps）6s 分片仍超 20MB 时自动缩短分片时长（按比例收紧，
+# 最低 2s），重试至全部 ≤19MB。关键帧粒度 ~0.5s，细切可行。
+#
+# 幂等自愈：m3u8 有标记且引用分片全部 ≤19MB 才跳过——已切过但仍有超大分片的会自动重切。
+#
 # 磁盘策略：blobless 克隆 + 旧分片走 raw URL 直接 curl 到工作区（不进 .git），
-# 每个视频处理完即推送 + 清理工作区，中断后可重跑（m3u8 内标记幂等跳过）。
+# 每个视频处理完即推送 + 清理工作区，中断后可重跑。
 #
 # 触发约定：仅当本工作流文件变更时自动跑（首次推送即触发）；
 # 自身提交不含 .github/ 变更，不会循环触发。也可手动 workflow_dispatch。
@@ -23,8 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
-      MARKER: '#ZX-HLS-RESPLIT:v1'
+      MARKER: '#ZX-HLS-RESPLIT:v2'
       SEG_TIME: '6'
+      SEG_MAX_BYTES: '19000000'
     steps:
       - name: 安装 ffmpeg（ubuntu-24.04 镜像不预装）
         run: |
@@ -53,6 +59,20 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
+          # 路径→大小映射（Trees API 拿元数据；blobless 克隆上 ls-tree -l 会懒拉全部 blob，禁用）
+          tree_sha=$(git rev-parse 'HEAD^{tree}')
+          tree_json=$(curl -sSf -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/trees/${tree_sha}?recursive=1")
+          if echo "$tree_json" | jq -e '.truncated == true' >/dev/null; then
+            echo "::error::tree API 截断，文件过多"; exit 1
+          fi
+          echo "$tree_json" | jq -r '.tree[]? | select(.type=="blob") | "\(.size)\t\(.path)"' > .sizes.tsv
+          declare -A SIZE
+          while IFS=$'\t' read -r sz path; do
+            SIZE["$path"]="$sz"
+          done < .sizes.tsv
+          echo "大小映射：${#SIZE[@]} 个文件"
+
           mapfile -t playlists < <(git ls-tree -r HEAD --name-only | grep '\.m3u8$' || true)
           echo "发现 ${#playlists[@]} 个 m3u8"
           : > purged.list
@@ -61,12 +81,6 @@ jobs:
             echo ""
             echo "===== 处理 $m ====="
 
-            # 已处理过则跳过（幂等，支持中断续跑）
-            if git show "HEAD:$m" | grep -qF "$MARKER"; then
-              echo "已处理过，跳过"
-              continue
-            fi
-
             # 按顺序取出分片名（非注释行，兼容 CRLF）
             mapfile -t segs < <(git show "HEAD:$m" | tr -d '\r' | grep -v '^#' | sed '/^\s*$/d')
             if [ "${#segs[@]}" -eq 0 ]; then
@@ -74,15 +88,23 @@ jobs:
               continue
             fi
 
-            # 分片须全部存在于当前 HEAD（防误删他引用）
-            missing=0
+            # 分片齐全 & 全部 ≤ 上限 & 已标记 → 跳过（幂等自愈条件）
+            marked=0
+            git show "HEAD:$m" | grep -qF "$MARKER" && marked=1
+            missing=0; oversized=0
             for s in "${segs[@]}"; do
-              if ! git cat-file -e "HEAD:$s" 2>/dev/null; then
-                echo "::warning::分片缺失 $s，跳过该视频"
+              if [ -z "${SIZE[$s]:-}" ]; then
                 missing=1
+              elif [ "${SIZE[$s]}" -gt "$SEG_MAX_BYTES" ]; then
+                oversized=1
               fi
             done
-            [ "$missing" = 0 ] || continue
+            if [ "$marked" = 1 ] && [ "$missing" = 0 ] && [ "$oversized" = 0 ]; then
+              echo "已处理且分片合规，跳过"
+              continue
+            fi
+            [ "$missing" = 0 ] || { echo "::warning::分片缺失，跳过该视频"; continue; }
+            [ "$oversized" = 0 ] || echo "检测到超大分片，重切"
 
             base="${m%.m3u8}"
             echo "拉取 ${#segs[@]} 个旧分片（raw 直连，不进 .git）..."
@@ -96,12 +118,22 @@ jobs:
             rm -f "$full"
             for s in "${segs[@]}"; do cat "$s" >> "$full"; done
 
-            # -c copy 按关键帧重切（无损，只在关键帧处落刀）
-            rm -f "${base}-hls-"*.ts
-            ffmpeg -hide_banner -loglevel error -y -i "$full" \
-              -c copy -f segment -segment_time "$SEG_TIME" \
-              -segment_list .work-list.m3u8 -segment_list_type m3u8 \
-              "${base}-hls-%05d.ts"
+            # 自适应重切：超 19MB 则按比例缩短分片时长（关键帧粒度 ~0.5s），最多重试 3 轮
+            seg_time="$SEG_TIME"
+            for attempt in 1 2 3; do
+              rm -f "${base}-hls-"*.ts .work-list.m3u8
+              ffmpeg -hide_banner -loglevel error -y -i "$full" \
+                -c copy -f segment -segment_time "$seg_time" \
+                -segment_list .work-list.m3u8 -segment_list_type m3u8 \
+                "${base}-hls-%05d.ts"
+              maxsz=0
+              for c in "${base}-hls-"*.ts; do
+                sz=$(stat -c%s "$c"); [ "$sz" -gt "$maxsz" ] && maxsz=$sz
+              done
+              echo "第 ${attempt} 轮：seg_time=${seg_time}s 最大分片 $((maxsz/1024/1024))MB"
+              [ "$maxsz" -le "$SEG_MAX_BYTES" ] && break
+              seg_time=$(python3 -c "print(max(2, int($seg_time * $SEG_MAX_BYTES * 0.85 / $maxsz)))")
+            done
             rm -f "$full"
 
             chunks=("${base}-hls-"*.ts)
@@ -113,8 +145,8 @@ jobs:
             # 分片体积检查（jsDelivr 单文件 20MB 上限）
             for c in "${chunks[@]}"; do
               sz=$(stat -c%s "$c")
-              if [ "$sz" -gt 19000000 ]; then
-                echo "::warning::分片 $((sz/1024/1024))MB 超 19MB（jsDelivr 会 403）：$c"
+              if [ "$sz" -gt "$SEG_MAX_BYTES" ]; then
+                echo "::warning::分片 $((sz/1024/1024))MB 仍超上限（源码率过高）：$c"
               fi
             done
 
@@ -130,7 +162,7 @@ jobs:
             set +f
             git add -- "$m" "${chunks[@]}"
 
-            git commit -q -m "chore: 重切 HLS 分片为 ${SEG_TIME}s 关键帧对齐小分片 — $base"
+            git commit -q -m "chore: 重切 HLS 分片为 ${seg_time}s 关键帧对齐小分片 — $base"
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
 
             # 清理工作区（新分片 blob 已随提交进入 .git，工作区副本可删）
